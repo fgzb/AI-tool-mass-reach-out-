@@ -1,0 +1,14 @@
+Subject: $company_name : une question rapide
+
+$greeting,
+
+Je me permets de vous contacter car nous accompagnons des entreprises comme $company_name ($city) sur [VOTRE PROPOSITION DE VALEUR EN UNE PHRASE].
+
+Concrètement, nous aidons nos clients à [BÉNÉFICE MESURABLE, ex. réduire de 20 % le temps passé sur ...].
+
+Seriez-vous la bonne personne pour en parler 15 minutes, ou pourriez-vous m'indiquer qui s'en occupe chez vous ?
+
+Bien cordialement,
+
+[PRÉNOM NOM]
+[FONCTION] - [TÉLÉPHONE]

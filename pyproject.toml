@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fr-outreach"
+version = "0.1.0"
+description = "Find French SMEs/ETIs in public registries, discover their websites and professional e-mails, and run compliant B2B e-mail outreach."
+requires-python = ">=3.10"
+dependencies = ["requests>=2.28", "PyYAML>=6.0"]
+
+[project.optional-dependencies]
+dns = ["dnspython>=2.4"]
+
+[project.scripts]
+fr-outreach = "fr_outreach.cli:main"
+
+[tool.setuptools]
+packages = ["fr_outreach", "fr_outreach.sources"]

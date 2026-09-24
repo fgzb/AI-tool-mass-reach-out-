@@ -1,0 +1,4 @@
+requests>=2.28
+PyYAML>=6.0
+# Optional: real MX-record checks on e-mail domains (falls back to A-record lookup otherwise)
+dnspython>=2.4 ; extra == "dns"
