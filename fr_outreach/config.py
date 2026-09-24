@@ -45,6 +45,30 @@ DEFAULTS: dict[str, Any] = {
         "check_mx": True,
     },
     "pappers": {"api_token_env": "PAPPERS_API_TOKEN"},
+    # When the agent is allowed to send (local time of `timezone`).
+    "schedule": {
+        "timezone": "Europe/Paris",
+        "days": ["mon", "tue", "wed", "thu", "fri"],
+        "start": "09:00",
+        "end": "17:00",
+        "skip_french_holidays": True,
+        "skip_periods": [],  # month-day ranges, e.g. ["08-01..08-23", "12-24..01-01"]
+    },
+    # Autonomous mode (`fr-outreach agent`).
+    "agent": {
+        "tick_seconds": 60,
+        "ready_buffer": 150,  # keep this many ready-to-send contacts in stock
+        "collect_batch": 50,  # new companies pulled from the registry per tick when stock is low
+        "discover_batch": 20,
+        "scrape_batch": 20,
+        "inbox_sync_minutes": 30,
+        "health_window_days": 7,
+        "health_min_sample": 20,
+        "max_bounce_rate": 0.05,  # auto-pause above this (bounces + rejections / attempts)
+        "max_optout_rate": 0.05,  # auto-pause above this (opt-out replies / sent)
+        "max_consecutive_smtp_errors": 5,
+        "report_to": "",  # daily report + alerts go to this address
+    },
     "mail": {
         "campaign": "default",
         "template": "templates/prospection_fr.txt",
@@ -73,10 +97,15 @@ DEFAULTS: dict[str, Any] = {
             "password_env": "IMAP_PASSWORD",
             "folder": "INBOX",
         },
-        "delay_seconds": 20,
+        "delay_seconds": 20,  # pause between two messages in a manual `send` run
         "jitter_seconds": 10,
         "max_per_run": 50,
-        "max_per_day": 200,
+        # Daily quota = min(max_per_day, start_per_day + increase_per_day x days already sent).
+        # Ramping up slowly ("warm-up") is what keeps a sending domain out of spam folders.
+        "max_per_day": 100,
+        "warmup": {"start_per_day": 15, "increase_per_day": 5},
+        # Never e-mail the same company again (any campaign) within this many days.
+        "recontact_after_days": 180,
         "outbox_dir": "outbox",
     },
 }
@@ -104,3 +133,16 @@ def load_config(path: str | os.PathLike[str] | None) -> dict[str, Any]:
 
 def secret(env_name: str | None) -> str:
     return os.environ.get(env_name or "", "")
+
+
+def load_dotenv(path: str = ".env") -> None:
+    """Minimal .env support (KEY=VALUE lines); variables already set in the environment win."""
+    if not Path(path).exists():
+        return
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        os.environ.setdefault(key, value.strip().strip("'\""))

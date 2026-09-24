@@ -1,0 +1,7 @@
+.git
+data
+outbox
+.env
+config.yaml
+**/__pycache__
+tests

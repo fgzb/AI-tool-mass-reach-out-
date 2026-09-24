@@ -90,24 +90,33 @@ class RechercheEntreprisesSource:
             queries.append(q)
         return queries
 
+    def fetch_page(self, query: dict[str, Any], page: int, exclude_individual: bool = True) -> tuple[list[Company], bool]:
+        """One page of results. Returns (companies, is_last_page)."""
+        data = self._get({**query, "page": page, "per_page": PER_PAGE})
+        if page == 1:
+            total = data.get("total_results", 0)
+            log.info("Query %s -> %s results", query, total)
+            if total > MAX_WINDOW:
+                log.warning(
+                    "Query %s has %s results but the API only pages through %s. "
+                    "Add departments / naf_sections to split it.", query, total, MAX_WINDOW,
+                )
+        companies = [parse_result(item) for item in data.get("results", [])]
+        if exclude_individual:
+            companies = [c for c in companies if not c.is_individual]
+        last = page >= (data.get("total_pages") or 0) or page * PER_PAGE >= MAX_WINDOW or not data.get("results")
+        return companies, last
+
     def search(self, search: dict[str, Any]) -> Iterator[Company]:
         max_results = search.get("max_results") or None
+        exclude_individual = search.get("exclude_individual", True)
         yielded = 0
         seen: set[str] = set()
         for query in self.build_queries(search):
-            page = 1
-            while True:
-                data = self._get({**query, "page": page, "per_page": PER_PAGE})
-                if page == 1:
-                    total = data.get("total_results", 0)
-                    log.info("Query %s -> %s results", query, total)
-                    if total > MAX_WINDOW:
-                        log.warning(
-                            "Query %s has %s results but the API only pages through %s. "
-                            "Add departments / naf_sections to split it.", query, total, MAX_WINDOW,
-                        )
-                for item in data.get("results", []):
-                    company = parse_result(item)
+            page, last = 1, False
+            while not last:
+                companies, last = self.fetch_page(query, page, exclude_individual)
+                for company in companies:
                     if company.siren in seen:
                         continue
                     seen.add(company.siren)
@@ -115,9 +124,6 @@ class RechercheEntreprisesSource:
                     yielded += 1
                     if max_results and yielded >= max_results:
                         return
-                total_pages = data.get("total_pages", 0)
-                if page >= total_pages or page * PER_PAGE >= MAX_WINDOW:
-                    break
                 page += 1
 
 

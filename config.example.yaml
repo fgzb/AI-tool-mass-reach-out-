@@ -1,4 +1,4 @@
-# Copy to config.yaml and adapt. Secrets are read from environment variables, never from this file.
+# Copy to config.yaml and adapt. Secrets (passwords, API keys) go in .env, never in this file.
 database: data/outreach.sqlite
 
 http:
@@ -9,11 +9,12 @@ http:
   respect_robots_txt: true
   workers: 8
 
-# What to look for (all filters optional, combined with AND).
+# Who to look for (all filters optional, combined with AND). The agent works through
+# this search page by page, remembering where it stopped.
 search:
   query: ""                    # free text, e.g. "logiciel" or "menuiserie"
   categories: [PME, ETI]       # INSEE catégorie d'entreprise: PME, ETI, GE
-  departments: ["69", "38"]    # splits the API search per department (avoids the 10 000 results cap)
+  departments: ["69", "38"]    # one API query per department (avoids the 10 000 results cap)
   regions: []                  # INSEE region codes (used when departments is empty), e.g. "84"
   postal_codes: []
   naf_codes: []                # e.g. ["62.01Z", "62.02A"]
@@ -22,7 +23,7 @@ search:
   revenue_min: null            # EUR (API: last published accounts only)
   revenue_max: null
   exclude_individual: true     # skip sole traders (entrepreneurs individuels)
-  max_results: 500
+  max_results: 500             # for the manual `collect` command only
 
 discovery:
   search_provider: null        # "brave" to use the Brave Search API (env BRAVE_API_KEY)
@@ -38,34 +39,65 @@ scraping:
 pappers:
   api_token_env: PAPPERS_API_TOKEN
 
+# When the agent may send (local time).
+schedule:
+  timezone: Europe/Paris
+  days: [mon, tue, wed, thu, fri]
+  start: "09:00"
+  end: "17:00"
+  skip_french_holidays: true
+  skip_periods: []             # e.g. ["08-01..08-23", "12-24..01-01"] (month-day ranges)
+
+agent:
+  tick_seconds: 60
+  ready_buffer: 150            # contacts kept ready in advance
+  collect_batch: 50
+  discover_batch: 20
+  scrape_batch: 20
+  inbox_sync_minutes: 30
+  health_window_days: 7
+  health_min_sample: 20
+  max_bounce_rate: 0.05        # pause automatically above 5 % bounces/rejections
+  max_optout_rate: 0.05        # pause automatically above 5 % opt-outs
+  max_consecutive_smtp_errors: 5
+  report_to: "vous@ma-societe.fr"   # daily report + alerts
+
 mail:
   campaign: "2026-10-premier-contact"
   template: templates/prospection_fr.txt
   from_name: "Prénom Nom - Ma Société"
   from_address: "prenom.nom@ma-societe.fr"
   reply_to: ""
-  # Mandatory sender identification + opt-out (the tool refuses to send without them).
+  # Mandatory sender identification (the tool refuses to send without it).
   company_legal_name: "Ma Société SAS"
   company_address: "1 rue de l'Exemple, 69001 Lyon"
-  unsubscribe_mailto: "desinscription@ma-societe.fr"
+  # Opt-outs: by default people reply "STOP" to from_address, which the agent reads over IMAP.
+  unsubscribe_mailto: ""
   unsubscribe_url: ""
   data_source_notice: >-
     Vos coordonnées professionnelles ont été collectées à partir du registre public des
     entreprises (INSEE/SIRENE) et de votre site internet.
-  smtp:
+  smtp:                        # `fr-outreach check-domain` suggests these for your provider
     host: smtp.ma-societe.fr
     port: 587
     security: starttls         # starttls | ssl | none
     username_env: SMTP_USERNAME
     password_env: SMTP_PASSWORD
-  imap:
+  imap:                        # required for the agent in live mode (opt-outs, bounces)
     host: imap.ma-societe.fr
     port: 993
     username_env: IMAP_USERNAME
     password_env: IMAP_PASSWORD
     folder: INBOX
-  delay_seconds: 20            # pacing between two e-mails
+  # Daily quota = min(max_per_day, start_per_day + increase_per_day x days already sent):
+  # 15, 20, 25 ... up to 100 after ~4 weeks of sending days. Never blast a list in one go.
+  max_per_day: 100
+  warmup:
+    start_per_day: 15
+    increase_per_day: 5
+  recontact_after_days: 180    # never e-mail the same company again within 6 months
+  # Manual `send` command only:
+  delay_seconds: 20
   jitter_seconds: 10
   max_per_run: 50
-  max_per_day: 200             # keep volumes low on a fresh domain to protect deliverability
   outbox_dir: outbox

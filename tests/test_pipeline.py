@@ -17,8 +17,8 @@ from fr_outreach.discovery import WebsiteFinder, domain_guesses
 from fr_outreach.emails import clean, extract_emails, rank, registrable_domain
 from fr_outreach.http import Page
 from fr_outreach.inbox import classify
-from fr_outreach.mailer import ComplianceError, run_campaign
-from fr_outreach.models import Company
+from fr_outreach.mailer import ComplianceError, SendBlocked, run_campaign
+from fr_outreach.models import EmailCandidate
 from fr_outreach.scraper import crawl_emails
 from fr_outreach.sources.csv_import import CsvSource
 from fr_outreach.sources.recherche_entreprises import RechercheEntreprisesSource, parse_result
@@ -197,37 +197,77 @@ class DiscoveryAndScrapeTests(unittest.TestCase):
         self.assertNotIn("https://acme.fr/blog", fetcher.requested)
 
 
+def make_cfg(tmpdir: str) -> dict:
+    """A complete config for tests (sender identity filled in, placeholder-free template)."""
+    cfg = load_config(None)
+    template = Path(tmpdir) / "template.txt"
+    template.write_text("Subject: $company_name : une question\n\n$greeting,\nNotre offre.\n", encoding="utf-8")
+    cfg["database"] = ":memory:"
+    cfg["mail"].update(
+        template=str(template), from_name="Marie Martin", from_address="marie@vendeur.fr",
+        company_legal_name="Vendeur SAS", company_address="1 rue X, 75001 Paris",
+        outbox_dir=tmpdir, delay_seconds=0, jitter_seconds=0,
+    )
+    cfg["mail"]["smtp"]["host"] = "smtp.test"
+    return cfg
+
+
+def add_company(store: Store, siren: str, emails: list[str], name: str = "ACME INDUSTRIE") -> None:
+    from fr_outreach.models import EmailCandidate
+
+    c = parse_result(dict(API_ITEM, siren=siren, nom_complet=name))
+    c.website = "https://acme.fr"
+    store.upsert_company(c)
+    store.add_emails(siren, [EmailCandidate(e, "https://acme.fr/contact", 90 - i) for i, e in enumerate(emails)], {})
+
+
+class FakeSender:
+    def __init__(self, sent: list, error: Exception | None = None):
+        self.sent, self.error = sent, error
+
+    def __call__(self, smtp_cfg):  # used as sender_factory
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+    def send(self, msg):
+        if self.error:
+            raise self.error
+        self.sent.append(msg)
+
+
 class MailerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(":memory:")
-        cfg = load_config(None)
-        self.mail = dict(cfg["mail"])
-        self.mail.update(
-            template=str(ROOT / "templates" / "prospection_fr.txt"),
-            from_name="Marie Martin", from_address="marie@vendeur.fr", company_legal_name="Vendeur SAS",
-            company_address="1 rue X, 75001 Paris", unsubscribe_mailto="stop@vendeur.fr",
-            outbox_dir=self.tmp.name, delay_seconds=0, jitter_seconds=0,
-        )
-        self.scraping = cfg["scraping"]
-        c = parse_result(API_ITEM)
-        c.website = "https://acme.fr"
-        self.store.upsert_company(c)
-        from fr_outreach.models import EmailCandidate
-
-        self.store.add_emails(c.siren, [EmailCandidate("contact@acme.fr", "https://acme.fr/contact", 90)], {"acme.fr": True})
+        self.cfg = make_cfg(self.tmp.name)
+        add_company(self.store, "552100554", ["contact@acme.fr"])
 
     def tearDown(self):
         self.store.close()
         self.tmp.cleanup()
 
-    def test_refuses_without_sender_identity_or_opt_out(self):
-        self.mail["unsubscribe_mailto"] = ""
+    def run_live(self, sender):
+        return run_campaign(self.store, self.cfg, really_send=True, sender_factory=sender, sleep=lambda s: None)
+
+    def test_refuses_without_sender_identity(self):
+        self.cfg["mail"]["company_address"] = ""
         with self.assertRaises(ComplianceError):
-            run_campaign(self.store, self.mail, self.scraping)
+            run_campaign(self.store, self.cfg)
+
+    def test_real_send_refused_while_template_has_placeholders(self):
+        self.cfg["mail"]["template"] = str(ROOT / "templates" / "prospection_fr.txt")
+        run_campaign(self.store, self.cfg)  # dry run is fine
+        with self.assertRaises(ComplianceError):
+            run_campaign(self.store, self.cfg, really_send=True)
 
     def test_dry_run_writes_compliant_eml(self):
-        counts = run_campaign(self.store, self.mail, self.scraping)
+        self.cfg["mail"]["template"] = str(ROOT / "templates" / "prospection_fr.txt")
+        counts = run_campaign(self.store, self.cfg)
         self.assertEqual(counts["dry_run"], 1)
         files = list(Path(self.tmp.name).rglob("*.eml"))
         self.assertEqual(len(files), 1)
@@ -238,52 +278,61 @@ class MailerTests(unittest.TestCase):
         self.assertIn("Bonjour Jean Dupont", body)
         self.assertIn("Vendeur SAS", body)
         self.assertIn("STOP", body)
-        self.assertIn("mailto:stop@vendeur.fr", msg["List-Unsubscribe"])
+        # no unsubscribe_mailto configured: opt-outs go to the sending mailbox
+        self.assertIn("mailto:marie@vendeur.fr", msg["List-Unsubscribe"])
         # dry runs can be regenerated
-        self.assertEqual(run_campaign(self.store, self.mail, self.scraping)["dry_run"], 1)
+        self.assertEqual(run_campaign(self.store, self.cfg)["dry_run"], 1)
 
-    def test_real_send_refused_while_template_has_placeholders(self):
-        with self.assertRaises(ComplianceError):
-            run_campaign(self.store, self.mail, self.scraping, really_send=True)
+    def test_dry_run_then_real_send_reaches_previewed_contacts(self):
+        run_campaign(self.store, self.cfg)
+        sent: list = []
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 1)
+        self.assertEqual(sent[0]["To"], "contact@acme.fr")
 
     def test_real_send_once_and_suppression(self):
-        tpl = Path(self.tmp.name) / "tpl.txt"
-        tpl.write_text("Subject: Bonjour $company_name\n\n$greeting,\nMessage.\n", encoding="utf-8")
-        self.mail["template"] = str(tpl)
-        sent = []
-
-        class FakeSender:
-            def __init__(self, cfg): pass
-            def __enter__(self): return self
-            def __exit__(self, *a): pass
-            def send(self, msg): sent.append(msg["To"])
-
-        run = lambda: run_campaign(self.store, self.mail, self.scraping, really_send=True,  # noqa: E731
-                                   sender_factory=FakeSender, sleep=lambda s: None)
-        self.assertEqual(run()["sent"], 1)
-        self.assertEqual(run()["sent"], 0)  # never twice in the same campaign
-        self.mail["campaign"] = "relance"
+        sent: list = []
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 1)
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 0)  # never twice in the same campaign
+        self.cfg["mail"]["campaign"] = "relance"
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 0)  # recontact_after_days
+        self.cfg["mail"]["recontact_after_days"] = 0
         self.store.suppress("@acme.fr", "optout")
-        self.assertEqual(run()["sent"], 0)  # suppressed domain
-        self.assertEqual(sent, ["contact@acme.fr"])
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 0)  # suppressed domain
+        self.assertEqual(len(sent), 1)
 
-    def test_bounce_is_suppressed(self):
-        tpl = Path(self.tmp.name) / "tpl.txt"
-        tpl.write_text("Subject: Bonjour\n\nMessage.\n", encoding="utf-8")
-        self.mail["template"] = str(tpl)
-        class RefusingSender:
-            def __init__(self, cfg): pass
-            def __enter__(self): return self
-            def __exit__(self, *a): pass
-            def send(self, msg): raise smtplib.SMTPRecipientsRefused({msg["To"]: (550, b"no such user")})
+    def test_daily_quota_is_enforced(self):
+        for i in range(30):
+            add_company(self.store, f"{i:09d}", [f"contact@societe{i}.fr"])
+        sent: list = []
+        self.cfg["mail"]["max_per_run"] = 0
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 15)  # warm-up day 1
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 0)
 
-        counts = run_campaign(self.store, self.mail, self.scraping, really_send=True,
-                              sender_factory=RefusingSender, sleep=lambda s: None)
+    def test_bounce_is_suppressed_and_next_address_used(self):
+        self.store.add_emails("552100554", [EmailCandidate("direction@acme.fr", "https://acme.fr/", 10)], {})
+        refused = smtplib.SMTPRecipientsRefused({"contact@acme.fr": (550, b"5.1.1 no such user")})
+        counts = self.run_live(FakeSender([], refused))
         self.assertEqual(counts["failed"], 1)
         self.assertTrue(self.store.is_suppressed("contact@acme.fr"))
+        sent: list = []
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 1)
+        self.assertEqual(sent[0]["To"], "direction@acme.fr")
+
+    def test_provider_quota_error_blocks_the_account_not_the_recipient(self):
+        refused = smtplib.SMTPRecipientsRefused({"contact@acme.fr": (550, b"5.4.5 Daily user sending limit exceeded")})
+        with self.assertRaises(SendBlocked):
+            self.run_live(FakeSender([], refused))
+        self.assertFalse(self.store.is_suppressed("contact@acme.fr"))
+        self.assertEqual(self.store.stats()["failed"], 0)
+
+    def test_temporary_error_frees_the_reservation(self):
+        counts = self.run_live(FakeSender([], smtplib.SMTPServerDisconnected("gone")))
+        self.assertEqual(counts["sent"] + counts["failed"], 0)
+        sent: list = []
+        self.assertEqual(self.run_live(FakeSender(sent))["sent"], 1)
 
 
-class InboxTests(unittest.TestCase):
+class InboxClassifyTests(unittest.TestCase):
     def test_optout_reply(self):
         msg = email.message_from_string(
             "From: Jean <contact@acme.fr>\nSubject: Re: question\n\nMerci de ne plus me contacter.\n\n"
@@ -296,7 +345,13 @@ class InboxTests(unittest.TestCase):
             "From: Jean <contact@acme.fr>\nSubject: Re: question\n\nOui, appelez-moi mardi.\n\n"
             "Le 1 oct. 2026, Marie a écrit :\n> répondez STOP à cet e-mail"
         )
-        self.assertEqual(classify(msg)[0], "other")
+        self.assertEqual(classify(msg)[0], "reply")
+
+    def test_auto_reply(self):
+        msg = email.message_from_string(
+            "From: contact@acme.fr\nSubject: Absence du bureau\nAuto-Submitted: auto-replied\n\nJe suis absent."
+        )
+        self.assertEqual(classify(msg)[0], "auto")
 
     def test_bounce(self):
         msg = email.message_from_string(

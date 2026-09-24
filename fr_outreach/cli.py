@@ -3,20 +3,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any
 
-from .config import load_config, secret
+from .agent import Agent, AgentLocked, pause, resume
+from .config import load_config, load_dotenv, secret
 from .db import Store
-from .discovery import WebsiteFinder
-from .emails import domain_accepts_mail
-from .http import Fetcher
-from .inbox import sync_unsubscribes
-from .mailer import ComplianceError, run_campaign
-from .scraper import crawl_emails
+from .domain_check import check_domain, format_report
+from .inbox import sync_inbox
+from .mailer import Campaign, ComplianceError, SendBlocked, run_campaign
+from .pipeline import discover_batch, scrape_batch
 from .sources import CsvSource, PappersSource, RechercheEntreprisesSource, SireneStockSource
 
 log = logging.getLogger("fr_outreach")
@@ -44,6 +44,13 @@ def search_filters(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, A
     return s
 
 
+def confirm_live(args: argparse.Namespace, what: str) -> None:
+    if args.yes or not sys.stdin.isatty():
+        return
+    if input(f"This will {what}. Type 'send' to continue: ").strip() != "send":
+        sys.exit("Aborted.")
+
+
 # -- commands -----------------------------------------------------------------
 def cmd_collect(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
     if args.source == "api":
@@ -68,69 +75,23 @@ def cmd_collect(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> 
 
 
 def cmd_discover(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
-    fetcher = Fetcher.from_config(cfg["http"])
-    finder = WebsiteFinder(fetcher, cfg["discovery"], secret(cfg["discovery"].get("brave_api_key_env")))
-    rows = [dict(r) for r in store.companies("discovery_done = 0", limit=args.limit)]
-    found = 0
-    with ThreadPoolExecutor(max_workers=cfg["http"]["workers"]) as pool:
-        futures = {pool.submit(finder.find, row): row for row in rows}
-        for fut in as_completed(futures):
-            row = futures[fut]
-            try:
-                url, source, conf = fut.result()
-            except Exception as exc:  # keep going on unexpected site errors
-                log.warning("discovery failed for %s: %s", row["siren"], exc)
-                store.mark(row["siren"], "discovery_done")
-                continue
-            if url:
-                store.set_website(row["siren"], url, source, conf)
-                found += 1
-                log.info("%s -> %s (%s, %d%%)", row["name"], url, source, conf)
-            else:
-                store.mark(row["siren"], "discovery_done")
-    print(f"Website found for {found}/{len(rows)} companies.")
+    found, n = discover_batch(store, cfg, args.limit)
+    print(f"Website found for {found}/{n} companies.")
 
 
 def cmd_scrape(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
-    fetcher = Fetcher.from_config(cfg["http"])
-    rows = store.companies("scrape_done = 0 AND website IS NOT NULL AND website != ''", limit=args.limit)
-    max_pages = cfg["scraping"]["max_pages_per_site"]
-    mx_cache: dict[str, Any] = {}
-    with_email = 0
-    with ThreadPoolExecutor(max_workers=cfg["http"]["workers"]) as pool:
-        futures = {pool.submit(crawl_emails, fetcher, r["website"], max_pages): r for r in rows}
-        for fut in as_completed(futures):
-            row = futures[fut]
-            try:
-                candidates = fut.result()
-            except Exception as exc:
-                log.warning("scrape failed for %s: %s", row["website"], exc)
-                candidates = []
-            if cfg["scraping"]["check_mx"]:
-                for c in candidates:
-                    dom = c.email.split("@", 1)[1]
-                    if dom not in mx_cache:
-                        mx_cache[dom] = domain_accepts_mail(dom)
-            added = store.add_emails(row["siren"], candidates, mx_cache)
-            store.mark(row["siren"], "scrape_done")
-            if candidates:
-                with_email += 1
-                log.info("%s: %s", row["name"], ", ".join(c.email for c in candidates[:3]))
-            elif added == 0:
-                log.debug("%s: no e-mail found", row["name"])
-    print(f"E-mails found for {with_email}/{len(rows)} websites.")
+    with_email, n = scrape_batch(store, cfg, args.limit)
+    print(f"E-mails found for {with_email}/{n} websites.")
 
 
 def cmd_send(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
     if args.campaign:
         cfg["mail"]["campaign"] = args.campaign
-    if args.send and not args.yes:
-        answer = input("This will send REAL e-mails. Type 'send' to continue: ")
-        if answer.strip() != "send":
-            sys.exit("Aborted.")
+    if args.send:
+        confirm_live(args, "send REAL e-mails")
     try:
-        counts = run_campaign(store, cfg["mail"], cfg["scraping"], really_send=args.send, limit=args.limit)
-    except ComplianceError as exc:
+        counts = run_campaign(store, cfg, really_send=args.send, limit=args.limit)
+    except (ComplianceError, SendBlocked) as exc:
         sys.exit(f"Refusing to send: {exc}")
     if args.send:
         print(f"Sent {counts['sent']}, failed {counts['failed']}.")
@@ -148,6 +109,62 @@ def cmd_run(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None
     cmd_send(cfg, store, args)
 
 
+def cmd_agent(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
+    if args.campaign:
+        cfg["mail"]["campaign"] = args.campaign
+    try:
+        agent = Agent(store, cfg, live=args.live)
+        agent.preflight()
+    except ComplianceError as exc:
+        sys.exit(f"Refusing to start: {exc}")
+    if args.live:
+        confirm_live(args, "start the agent in LIVE mode (it sends real e-mails every day)")
+    try:
+        agent.run(once=args.once, force=args.force)
+    except AgentLocked as exc:
+        sys.exit(f"{exc}. Use --force if you are sure it is not running.")
+    except KeyboardInterrupt:
+        print("Agent stopped.")
+
+
+def cmd_status(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
+    now = datetime.now(timezone.utc)
+    try:
+        campaign = Campaign(store, cfg, live=True, strict=False)
+    except (ComplianceError, OSError) as exc:
+        print(f"(mail settings incomplete: {exc})")
+        campaign = None
+    paused = store.get_state("paused")
+    print(f"{'agent':>22}: {'PAUSED - ' + paused if paused else 'not paused'}")
+    if campaign:
+        sched = campaign.schedule
+        local = sched.local(now)
+        print(f"{'campaign':>22}: {campaign.name}"
+              + (" (template still has [PLACEHOLDERS]: live sending is blocked)" if campaign.has_placeholders else ""))
+        print(f"{'now (local)':>22}: {local:%a %d/%m %H:%M}, {'inside' if sched.in_window(now) else 'outside'} "
+              f"the sending window ({sched.start:%H:%M}-{sched.end:%H:%M}, sending day: {sched.is_sending_day(local.date())})")
+        print(f"{'quota today':>22}: {campaign.quota_today(now)} (sent/failed today: {campaign.done_today(now)})")
+        print(f"{'ready to contact':>22}: {campaign.ready()}")
+    print(f"{'next send after':>22}: {store.get_state('next_send_at', '-')}")
+    print(f"{'last inbox sync':>22}: {store.get_state('inbox:last_sync', '-')}")
+    cursors = store.states("cursor:")
+    done = sum(1 for v in cursors.values() if v == "done")
+    print(f"{'registry queries':>22}: {done}/{len(cursors)} finished"
+          + (" - search exhausted" if store.get_state("search_exhausted") else ""))
+    for key, value in store.stats().items():
+        print(f"{key:>22}: {value}")
+
+
+def cmd_pause(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
+    pause(store, args.reason)
+    print("Agent paused: nothing will be sent until `fr-outreach resume`.")
+
+
+def cmd_resume(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
+    resume(store)
+    print("Agent resumed.")
+
+
 def cmd_suppress(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
     for value in args.values:
         store.suppress(value, args.reason)
@@ -155,8 +172,22 @@ def cmd_suppress(cfg: dict[str, Any], store: Store, args: argparse.Namespace) ->
 
 
 def cmd_sync_inbox(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
-    counts = sync_unsubscribes(store, cfg["mail"]["imap"], mark_seen=args.mark_seen)
-    print(f"Opt-outs: {counts['optout']}, bounces: {counts['bounce']}, other replies: {counts['other']}.")
+    c = sync_inbox(store, cfg["mail"]["imap"], days=args.days)
+    print(f"Replies: {c['reply']}, opt-outs: {c['optout']}, bounces: {c['bounce']}, "
+          f"auto-replies: {c['auto']}, unrelated: {c['other']}.")
+
+
+def cmd_check_domain(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
+    target = args.domain or cfg["mail"].get("from_address")
+    if not target:
+        sys.exit("Give a domain or an e-mail address (or set mail.from_address).")
+    try:
+        result = check_domain(target, dkim_selectors=_split(args.dkim_selector) or None)
+    except Exception as exc:  # DNS / network failure
+        sys.exit(f"DNS lookup failed ({exc}). Install dnspython or check the network, then retry.")
+    print(format_report(result))
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
 def cmd_export(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
@@ -210,6 +241,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p = sub.add_parser("agent", help="run everything automatically, every day (rehearsal unless --live)")
+    p.add_argument("--live", action="store_true", help="really send e-mails")
+    p.add_argument("--once", action="store_true", help="run a single iteration (for cron)")
+    p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p.add_argument("--force", action="store_true", help="take over a lock left by a crashed agent")
+    p.add_argument("--campaign")
+    p.set_defaults(func=cmd_agent)
+
+    p = sub.add_parser("status", help="agent state, today's quota, pipeline counters")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("pause", help="stop the agent from sending")
+    p.add_argument("--reason", default="paused manually")
+    p.set_defaults(func=cmd_pause)
+
+    p = sub.add_parser("resume", help="let the agent send again")
+    p.set_defaults(func=cmd_resume)
+
+    p = sub.add_parser("check-domain", help="check SPF / DKIM / DMARC / MX of the sending domain")
+    p.add_argument("domain", nargs="?", help="domain or e-mail address (default: mail.from_address)")
+    p.add_argument("--dkim-selector", help="DKIM selector(s) to look up, comma-separated")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_check_domain)
+
     p = sub.add_parser("collect", help="1. pull companies from a French registry/database")
     add_collect_args(p)
     p.set_defaults(func=cmd_collect)
@@ -222,12 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int)
     p.set_defaults(func=cmd_scrape)
 
-    p = sub.add_parser("send", help="4. send the campaign (dry run unless --send)")
+    p = sub.add_parser("send", help="4. send the campaign once (dry run unless --send)")
     p.add_argument("--limit", type=int)
     add_send_args(p)
     p.set_defaults(func=cmd_send)
 
-    p = sub.add_parser("run", help="collect + discover + scrape + send in one go")
+    p = sub.add_parser("run", help="collect + discover + scrape + send, once")
     add_collect_args(p)
     add_send_args(p)
     p.add_argument("--limit", type=int, help="max companies per stage / messages")
@@ -238,8 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", default="manual")
     p.set_defaults(func=cmd_suppress)
 
-    p = sub.add_parser("sync-inbox", help="read replies over IMAP; record opt-outs and bounces")
-    p.add_argument("--mark-seen", action="store_true")
+    p = sub.add_parser("sync-inbox", help="read replies over IMAP; record opt-outs, bounces and replies")
+    p.add_argument("--days", type=int, default=14, help="look back this many days on the first sync")
     p.set_defaults(func=cmd_sync_inbox)
 
     p = sub.add_parser("export", help="export companies + e-mails to CSV for review")
@@ -258,6 +313,7 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    load_dotenv()
     # A missing default config.yaml is fine (built-in defaults); a missing explicit path is an error.
     cfg = load_config(args.config if os.path.exists(args.config) or args.config != "config.yaml" else None)
     store = Store(cfg["database"])
