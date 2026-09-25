@@ -11,13 +11,15 @@ Built-in safeguards for French/EU B2B prospecting rules (CNIL, RGPD, art. L34-5 
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 import random
 import re
 import smtplib
 import ssl
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 from pathlib import Path
@@ -27,7 +29,7 @@ from typing import Any, Callable, Optional
 from .config import secret
 from .db import Store
 from .models import HEADCOUNT_BANDS
-from .schedule import Schedule, daily_quota
+from .schedule import Schedule, daily_quota, iso
 
 log = logging.getLogger(__name__)
 
@@ -96,8 +98,11 @@ def footer(mail_cfg: dict[str, Any]) -> str:
     )
 
 
-def build_message(mail_cfg: dict[str, Any], subject_t: str, body_t: str, company: Any, to_addr: str) -> EmailMessage:
-    variables = template_vars(company, to_addr)
+def build_message(
+    mail_cfg: dict[str, Any], subject_t: str, body_t: str, company: Any, to_addr: str,
+    extra_vars: Optional[dict[str, str]] = None, in_reply_to: str = "",
+) -> EmailMessage:
+    variables = {**template_vars(company, to_addr), **(extra_vars or {})}
     msg = EmailMessage()
     msg["From"] = formataddr((mail_cfg["from_name"], mail_cfg["from_address"]))
     msg["To"] = to_addr
@@ -112,6 +117,9 @@ def build_message(mail_cfg: dict[str, Any], subject_t: str, body_t: str, company
         msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
     msg["List-Unsubscribe"] = ", ".join(unsub)
     msg["X-Campaign"] = mail_cfg.get("campaign", "default")
+    if in_reply_to:  # follow-up: same thread as the first e-mail
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
     msg.set_content(Template(body_t).safe_substitute(variables) + footer(mail_cfg))
     return msg
 
@@ -153,7 +161,7 @@ class SmtpSender:
 
 
 class Campaign:
-    """One outreach campaign: template, recipients, delivery and bookkeeping."""
+    """One outreach campaign: templates (A/B variants), follow-up, recipients, delivery, bookkeeping."""
 
     def __init__(self, store: Store, cfg: dict[str, Any], live: bool, strict: bool = True):
         self.store = store
@@ -164,72 +172,146 @@ class Campaign:
         self.recontact_days = int(self.mail.get("recontact_after_days") or 0)
         self.schedule = Schedule(cfg["schedule"])
         check_compliance(self.mail)
-        self.subject_t, self.body_t = load_template(self.mail["template"])
-        self.has_placeholders = bool(PLACEHOLDER_RE.search(self.subject_t + self.body_t))
+        # A/B testing: each company always gets the same variant (stable hash of its SIREN).
+        paths = self.mail.get("templates") or [self.mail["template"]]
+        self.variants = [(Path(p).stem, *load_template(p)) for p in paths]
+        fu = self.mail.get("followup") or {}
+        self.followup = load_template(fu["template"]) if fu.get("enabled") else None
+        self.followup_days = int(fu.get("after_business_days", 4))
+        self.followup_expire_days = int(fu.get("expire_after_days", 14))
+        self.followup_share = float(fu.get("max_share", 0.5))
+        texts = [subject + body for _, subject, body in self.variants] + (list(self.followup) if self.followup else [])
+        self.has_placeholders = any(PLACEHOLDER_RE.search(t) for t in texts)
         if live and strict and self.has_placeholders:
-            raise ComplianceError(f"template {self.mail['template']} still contains [PLACEHOLDERS]; edit it first")
+            raise ComplianceError("a template still contains [PLACEHOLDERS]; edit it first")
         self.outbox = Path(self.mail.get("outbox_dir") or "outbox") / self.name
 
     # -- quota ------------------------------------------------------------------
     def quota_today(self, now_utc: datetime) -> int:
         return daily_quota(self.store, self.mail, self.schedule.day_start_utc(now_utc))
 
-    def done_today(self, now_utc: datetime) -> int:
-        statuses = ("sent", "failed") if self.live else ("dry_run",)
+    def _statuses(self) -> tuple[str, ...]:
+        return ("sent", "failed") if self.live else ("dry_run",)
+
+    def done_today(self, now_utc: datetime, step: Optional[int] = None) -> int:
         start = self.schedule.day_start_utc(now_utc).isoformat(timespec="seconds")
-        return self.store.count_sends_since(start, statuses)
+        return self.store.count_sends_since(start, self._statuses(), step)
 
     def remaining_today(self, now_utc: datetime) -> int:
         return max(0, self.quota_today(now_utc) - self.done_today(now_utc))
 
+    def warming_up(self, now_utc: datetime) -> bool:
+        return self.quota_today(now_utc) < int(self.mail.get("max_per_day") or 10**9)
+
     # -- recipients ----------------------------------------------------------------
-    def recipients(self, limit: Optional[int] = None) -> list[Any]:
-        return self.store.recipients(self.name, self.per_company, not self.live, self.recontact_days, limit)
+    def recipients(self, limit: Optional[int] = None, best_first: bool = False) -> list[Any]:
+        return self.store.recipients(
+            self.name, self.per_company, not self.live, self.recontact_days, limit, best_first
+        )
 
     def ready(self) -> int:
         return self.store.count_ready(self.name, self.per_company, not self.live, self.recontact_days)
 
+    def followups_due(self, now_utc: datetime, limit: Optional[int] = None) -> list[Any]:
+        if not self.followup:
+            return []
+        cutoff = self.schedule.business_days_cutoff(now_utc, self.followup_days)
+        expire = cutoff - timedelta(days=self.followup_expire_days)
+        return self.store.followups_due(self.name, iso(cutoff), iso(expire), not self.live, limit)
+
+    def plan(self, now_utc: datetime, n: int) -> list[tuple[Any, int]]:
+        """The next `n` messages as (row, step): follow-ups interleaved with first e-mails.
+
+        Follow-ups take at most `followup.max_share` of the day (unless there is nothing else
+        to send), so new companies keep being contacted every day.
+        """
+        if n <= 0:
+            return []
+        due = self.followups_due(now_utc, limit=n)
+        allowed = max(0, math.ceil(self.followup_share * (self.done_today(now_utc) + n)) - self.done_today(now_utc, 2))
+        followups = due[:allowed]
+        new = self.recipients(n - len(followups), best_first=self.warming_up(now_utc)) if n > len(followups) else []
+        missing = n - len(followups) - len(new)
+        if missing > 0:  # nothing new to send: the rest of the quota can go to follow-ups
+            followups += due[len(followups):len(followups) + missing]
+        return [(row, 2) for row in followups] + [(row, 1) for row in new]
+
+    # -- rendering -----------------------------------------------------------------------
+    def variant(self, siren: str, name: Optional[str] = None) -> tuple[str, str, str]:
+        for variant in self.variants:
+            if variant[0] == name:
+                return variant
+        return self.variants[int(hashlib.sha1(siren.encode()).hexdigest(), 16) % len(self.variants)]
+
+    def render(self, row: Any, step: int = 1, parent_message_id: str = "", variant_name: Optional[str] = None) -> tuple[EmailMessage, str]:
+        to_addr = row["email"]
+        name, subject_t, body_t = self.variant(row["siren"], variant_name)
+        if step == 1:
+            return build_message(self.mail, subject_t, body_t, row, to_addr), name
+        assert self.followup is not None
+        original_subject = Template(subject_t).safe_substitute(template_vars(row, to_addr))
+        followup_subject, followup_body = self.followup
+        msg = build_message(
+            self.mail, followup_subject, followup_body, row, to_addr,
+            extra_vars={"original_subject": original_subject}, in_reply_to=parent_message_id,
+        )
+        return msg, name
+
+    @staticmethod
+    def _parent(row: Any, step: int) -> tuple[str, Optional[str]]:
+        if step == 1:
+            return "", None
+        return row["parent_message_id"] or "", row["variant"]
+
     # -- delivery ---------------------------------------------------------------------
-    def preview(self, company: Any, to_addr: str) -> str:
-        msg = build_message(self.mail, self.subject_t, self.body_t, company, to_addr)
+    def preview(self, row: Any, step: int = 1) -> str:
+        msg, variant = self.render(row, step, *self._parent(row, step))
         self.outbox.mkdir(parents=True, exist_ok=True)
-        (self.outbox / f"{company['siren']}_{to_addr.replace('@', '_at_')}.eml").write_bytes(bytes(msg))
-        self.store.record_send(company["siren"], to_addr, self.name, "dry_run", msg["Message-ID"])
+        stem = f"{row['siren']}_{row['email'].replace('@', '_at_')}"
+        (self.outbox / f"{stem}{'' if step == 1 else '_relance'}.eml").write_bytes(bytes(msg))
+        if step == 1 and self.followup:  # also show what the follow-up will look like
+            follow, _ = self.render(row, 2, msg["Message-ID"], variant)
+            (self.outbox / f"{stem}_relance.eml").write_bytes(bytes(follow))
+        self.store.record_send(row["siren"], row["email"], self.name, "dry_run", msg["Message-ID"], step=step, variant=variant)
         return "dry_run"
 
-    def deliver(self, sender: Any, company: Any, to_addr: str) -> str:
+    def deliver(self, sender: Any, row: Any, step: int = 1) -> str:
         """Send one message. Returns "sent" or "failed"; raises SendBlocked or transient errors."""
-        msg = build_message(self.mail, self.subject_t, self.body_t, company, to_addr)
-        siren = company["siren"]
+        msg, variant = self.render(row, step, *self._parent(row, step))
+        siren, to_addr, mid = row["siren"], row["email"], msg["Message-ID"]
+
+        def record(status: str, error: str = "") -> None:
+            self.store.record_send(siren, to_addr, self.name, status, mid, error, step=step, variant=variant)
+
         # Reserve first: if we crash mid-send we will not e-mail this person twice.
-        self.store.record_send(siren, to_addr, self.name, "pending", msg["Message-ID"])
+        record("pending")
         try:
             sender.send(msg)
         except smtplib.SMTPRecipientsRefused as exc:
             detail = str(exc.recipients)
             if ACCOUNT_BLOCK_RE.search(detail):
-                self.store.delete_send(to_addr, self.name)
+                self.store.delete_send(to_addr, self.name, step)
                 raise SendBlocked(detail) from exc
-            self.store.record_send(siren, to_addr, self.name, "failed", msg["Message-ID"], detail)
+            record("failed", detail)
             self.store.suppress(to_addr, "bounce")
             return "failed"
         except smtplib.SMTPSenderRefused as exc:
-            self.store.delete_send(to_addr, self.name)
+            self.store.delete_send(to_addr, self.name, step)
             raise SendBlocked(f"sender refused: {exc}") from exc
         except smtplib.SMTPResponseException as exc:
             detail = f"{exc.smtp_code} {exc.smtp_error!r}"
             if exc.smtp_code >= 500 and not ACCOUNT_BLOCK_RE.search(detail):
-                self.store.record_send(siren, to_addr, self.name, "failed", msg["Message-ID"], detail)
+                record("failed", detail)
                 return "failed"  # rejected by the recipient's server
-            self.store.delete_send(to_addr, self.name)
+            self.store.delete_send(to_addr, self.name, step)
             if exc.smtp_code >= 500:
                 raise SendBlocked(detail) from exc
             raise  # 4xx: temporary, retry later
         except BaseException:
-            self.store.delete_send(to_addr, self.name)  # not sent: free the reservation
+            self.store.delete_send(to_addr, self.name, step)  # not sent: free the reservation
             raise
-        self.store.record_send(siren, to_addr, self.name, "sent", msg["Message-ID"])
-        log.info("sent to %s (%s)", to_addr, company["name"])
+        record("sent")
+        log.info("sent %s to %s (%s)", "follow-up" if step == 2 else "e-mail", to_addr, row["name"])
         return "sent"
 
 
@@ -241,31 +323,32 @@ def run_campaign(
     sender_factory: Callable[[dict[str, Any]], Any] = SmtpSender,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, int]:
-    """Manual one-off run (`fr-outreach send`)."""
+    """Manual one-off run (`fr-outreach send`): due follow-ups + first e-mails, within today's quota."""
     campaign = Campaign(store, cfg, live=really_send)
     mail_cfg = cfg["mail"]
+    now = store.clock()
     counts = {"sent": 0, "dry_run": 0, "failed": 0}
     caps = [int(x) for x in (limit, mail_cfg.get("max_per_run")) if x]
     if really_send:
-        caps.append(campaign.remaining_today(store.clock()))
+        caps.append(campaign.remaining_today(now))
         if caps[-1] == 0:
             log.warning("Today's quota is used up (warm-up / max_per_day).")
             return counts
     else:
         store.clear_dry_runs(campaign.name)  # previews can be regenerated any time
-    recipients = campaign.recipients(min(caps) if caps else None)
+    plan = campaign.plan(now, min(caps) if caps else 10**6)
     if not really_send:
-        for company in recipients:
-            counts[campaign.preview(company, company["email"])] += 1
+        for row, step in plan:
+            counts[campaign.preview(row, step)] += 1
         return counts
     with sender_factory(mail_cfg["smtp"]) as sender:
-        for i, company in enumerate(recipients):
+        for i, (row, step) in enumerate(plan):
             if i:
                 sleep(float(mail_cfg.get("delay_seconds") or 0) + random.uniform(0, float(mail_cfg.get("jitter_seconds") or 0)))
             try:
-                counts[campaign.deliver(sender, company, company["email"])] += 1
+                counts[campaign.deliver(sender, row, step)] += 1
             except SendBlocked:
                 raise
             except (smtplib.SMTPException, OSError) as exc:
-                log.error("send to %s failed temporarily: %s", company["email"], exc)
+                log.error("send to %s failed temporarily: %s", row["email"], exc)
     return counts

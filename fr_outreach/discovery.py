@@ -36,6 +36,14 @@ LEGAL_FORMS = r"\b(sas|sasu|sarl|eurl|sa|sci|snc|scop|selarl|selas|eirl|ei|group
 LEGAL_LINK_RE = re.compile(r"mentions?[-_ ]?l[eé]gales?|legal|cgv|cgu|a-propos|about|qui-sommes|contact", re.I)
 HREF_RE = re.compile(r"<a\s[^>]*href=[\"']([^\"'#]+)[\"'][^>]*>(.*?)</a>", re.I | re.S)
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+# Parking / for-sale pages often repeat the company name from the domain: never accept them.
+PARKED_RE = re.compile(
+    r"domain (name )?(is |may be )?for sale|ce (nom de )?domaine est (à|a) vendre|domaine (à|a) vendre|"
+    r"buy this domain|acheter ce (nom de )?domaine|sedoparking|parkingcrew|bodis\.com|afternic|dan\.com/buy|"
+    r"this domain (name )?(has been|is) (registered|parked)|site en construction chez|"
+    r"domaine (réservé|enregistré) (par|chez)|hébergé par (ovh|ionos|gandi).{0,40}(bientôt|prochainement)",
+    re.I,
+)
 
 
 def normalize(text: str) -> str:
@@ -47,7 +55,7 @@ def name_tokens(name: str) -> list[str]:
     return [t for t in re.sub(LEGAL_FORMS, " ", normalize(name)).split() if len(t) > 2]
 
 
-def domain_guesses(name: str, sigle: str = "") -> list[str]:
+def domain_guesses(name: str, sigle: str = "", city: str = "") -> list[str]:
     base = re.sub(LEGAL_FORMS, " ", normalize(name)).split()
     if not base:
         return []
@@ -59,6 +67,9 @@ def domain_guesses(name: str, sigle: str = "") -> list[str]:
     out = []
     for stem in sorted(s for s in stems if 3 <= len(s) <= 40):
         out += [f"https://www.{stem}.fr", f"https://www.{stem}.com"]
+    city_slug = normalize(city).replace(" ", "-")
+    if city_slug and len(base) <= 3:  # common for local businesses: boulangerie-martin-lyon.fr
+        out.append(f"https://www.{'-'.join(base)}-{city_slug}.fr")
     return out
 
 
@@ -69,6 +80,19 @@ def links(page_html: str, base_url: str) -> list[tuple[str, str]]:
         if url.startswith(("http://", "https://")):
             out.append((url, re.sub(r"<[^>]+>", " ", label)))
     return out
+
+
+def legal_links(page_html: str, base_url: str) -> list[str]:
+    """Same-site links to legal / contact / about pages, legal notice first, without duplicates."""
+    ranked: dict[str, int] = {}
+    for url, label in links(page_html, base_url):
+        url = url.split("#")[0]
+        text = f"{url} {label}"
+        if not same_site(url, base_url) or not LEGAL_LINK_RE.search(text):
+            continue
+        rank = 0 if re.search(r"mention|l[ée]gal", text, re.I) else 1 if re.search(r"contact", text, re.I) else 2
+        ranked[url] = min(rank, ranked.get(url, rank))
+    return sorted(ranked, key=ranked.__getitem__)
 
 
 def same_site(url_a: str, url_b: str) -> bool:
@@ -120,19 +144,22 @@ class WebsiteFinder:
         if home is None:
             return 0, url
         pages = [home]
-        # The SIREN is normally in the "mentions légales" page.
-        for link, label in links(home.text, home.url):
-            if same_site(link, home.url) and (LEGAL_LINK_RE.search(link) or LEGAL_LINK_RE.search(label)):
-                page = self.fetcher.get(link)
-                if page:
-                    pages.append(page)
-                if len(pages) >= 3:
-                    break
+        siren = company["siren"]
+        # Legal notice first (French sites must show their SIREN there), then contact / about pages.
+        # Those pages stay in the fetcher's cache, so the e-mail crawl gets them for free.
+        for link in legal_links(home.text, home.url)[:2]:
+            if siren in re.sub(r"[\s.\u00a0]", "", " ".join(p.text for p in pages)):
+                break
+            page = self.fetcher.get(link)
+            if page:
+                pages.append(page)
         return self.confidence(pages, company), home.url
 
     @staticmethod
     def confidence(pages: list[Any], company: dict[str, Any]) -> int:
         blob = " ".join(p.text for p in pages)
+        if PARKED_RE.search(blob):
+            return 0
         flat = re.sub(r"[\s. ]", "", blob)
         norm = normalize(blob)
         siren = company["siren"]
@@ -160,7 +187,10 @@ class WebsiteFinder:
             candidates.append((url, company.get("website_source") or "source"))
         candidates += [(u, "search") for u in self.search_candidates(company)]
         if self.guess:
-            candidates += [(u, "guess") for u in domain_guesses(company["name"], company.get("sigle") or "")]
+            resolves = getattr(self.fetcher, "resolves", lambda url: True)
+            guesses = domain_guesses(company["name"], company.get("sigle") or "", company.get("city") or "")
+            # A DNS lookup costs a few ms; an HTTP attempt on a dead domain costs seconds.
+            candidates += [(u, "guess") for u in guesses if resolves(u)]
 
         best = ("", "", 0)
         seen: set[str] = set()

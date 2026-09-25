@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 OPT_OUT_RE = re.compile(
     r"\b(stop|unsubscribe|d[ée]sinscri\w*|d[ée]sabonn\w*|retirez[- ]moi|retirer (mon|notre) adresse|"
     r"ne (plus|pas) (me |nous )?(contacter|recontacter|[ée]crire|solliciter)|ne plus recevoir|"
-    r"pas int[ée]ress[ée]e?s?)\b",
+    r"pas int[ée]ress[ée]e?s?|non merci)\b",
     re.I,
 )
 AUTO_SUBJECT_RE = re.compile(

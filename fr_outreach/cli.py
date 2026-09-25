@@ -16,7 +16,7 @@ from .db import Store
 from .domain_check import check_domain, format_report
 from .inbox import sync_inbox
 from .mailer import Campaign, ComplianceError, SendBlocked, run_campaign
-from .pipeline import discover_batch, scrape_batch
+from .pipeline import discover_batch, enrich_batch, scrape_batch
 from .sources import CsvSource, PappersSource, RechercheEntreprisesSource, SireneStockSource
 
 log = logging.getLogger("fr_outreach")
@@ -65,12 +65,7 @@ def cmd_collect(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> 
         if not args.csv:
             sys.exit("--csv is required for --source csv")
         source = CsvSource(args.csv, label=args.label or "csv")
-    new = total = 0
-    for company in source.search(search_filters(cfg, args)):
-        total += 1
-        new += store.upsert_company(company)
-        if total % 100 == 0:
-            log.info("%d companies collected (%d new)", total, new)
+    total, new = store.upsert_companies(source.search(search_filters(cfg, args)))
     print(f"Collected {total} companies ({new} new) from {args.source}.")
 
 
@@ -82,6 +77,11 @@ def cmd_discover(cfg: dict[str, Any], store: Store, args: argparse.Namespace) ->
 def cmd_scrape(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
     with_email, n = scrape_batch(store, cfg, args.limit)
     print(f"E-mails found for {with_email}/{n} websites.")
+
+
+def cmd_enrich(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
+    websites, with_email, n = enrich_batch(store, cfg, args.limit)
+    print(f"{n} companies processed: {websites} new websites, e-mails found for {with_email}.")
 
 
 def cmd_send(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
@@ -104,8 +104,7 @@ def cmd_send(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> Non
 
 def cmd_run(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> None:
     cmd_collect(cfg, store, args)
-    cmd_discover(cfg, store, args)
-    cmd_scrape(cfg, store, args)
+    cmd_enrich(cfg, store, args)
     cmd_send(cfg, store, args)
 
 
@@ -145,6 +144,10 @@ def cmd_status(cfg: dict[str, Any], store: Store, args: argparse.Namespace) -> N
               f"the sending window ({sched.start:%H:%M}-{sched.end:%H:%M}, sending day: {sched.is_sending_day(local.date())})")
         print(f"{'quota today':>22}: {campaign.quota_today(now)} (sent/failed today: {campaign.done_today(now)})")
         print(f"{'ready to contact':>22}: {campaign.ready()}")
+        if campaign.followup:
+            print(f"{'follow-ups due':>22}: {len(campaign.followups_due(now))}")
+        if len(campaign.variants) > 1:
+            print(f"{'A/B variants':>22}: {', '.join(v[0] for v in campaign.variants)}")
     print(f"{'next send after':>22}: {store.get_state('next_send_at', '-')}")
     print(f"{'last inbox sync':>22}: {store.get_state('inbox:last_sync', '-')}")
     cursors = store.states("cursor:")
@@ -269,6 +272,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_collect_args(p)
     p.set_defaults(func=cmd_collect)
 
+    p = sub.add_parser("enrich", help="2+3. find each company's website and its e-mails in one pass (fastest)")
+    p.add_argument("--limit", type=int)
+    p.set_defaults(func=cmd_enrich)
+
     p = sub.add_parser("discover", help="2. find and verify each company's website")
     p.add_argument("--limit", type=int)
     p.set_defaults(func=cmd_discover)
@@ -282,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_send_args(p)
     p.set_defaults(func=cmd_send)
 
-    p = sub.add_parser("run", help="collect + discover + scrape + send, once")
+    p = sub.add_parser("run", help="collect + enrich + send, once")
     add_collect_args(p)
     add_send_args(p)
     p.add_argument("--limit", type=int, help="max companies per stage / messages")

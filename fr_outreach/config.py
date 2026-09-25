@@ -13,6 +13,7 @@ DEFAULTS: dict[str, Any] = {
     "http": {
         "user_agent": "FrOutreachBot/0.1 (+contact: set-your-address@example.com)",
         "timeout": 15,
+        "connect_timeout": 5,
         "max_bytes": 2_000_000,
         "per_host_delay": 1.0,
         "respect_robots_txt": True,
@@ -59,8 +60,7 @@ DEFAULTS: dict[str, Any] = {
         "tick_seconds": 60,
         "ready_buffer": 150,  # keep this many ready-to-send contacts in stock
         "collect_batch": 50,  # new companies pulled from the registry per tick when stock is low
-        "discover_batch": 20,
-        "scrape_batch": 20,
+        "enrich_batch": 20,  # companies whose website + e-mails are looked up per tick
         "inbox_sync_minutes": 30,
         "health_window_days": 7,
         "health_min_sample": 20,
@@ -106,6 +106,16 @@ DEFAULTS: dict[str, Any] = {
         "warmup": {"start_per_day": 15, "increase_per_day": 5},
         # Never e-mail the same company again (any campaign) within this many days.
         "recontact_after_days": 180,
+        # A/B test: list several templates; each company always gets the same one.
+        "templates": [],
+        # One follow-up in the same thread if nobody replied, opted out or bounced.
+        "followup": {
+            "enabled": True,
+            "template": "templates/relance_fr.txt",
+            "after_business_days": 4,
+            "expire_after_days": 14,  # too late after that: skip it
+            "max_share": 0.5,  # follow-ups use at most half of the daily quota
+        },
         "outbox_dir": "outbox",
     },
 }

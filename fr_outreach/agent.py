@@ -29,10 +29,12 @@ from email.utils import formataddr, formatdate, make_msgid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import requests
+
 from .db import Store
 from .inbox import sync_inbox
 from .mailer import Campaign, ComplianceError, SendBlocked, SmtpSender
-from .pipeline import collect_incremental, discover_batch, scrape_batch, search_exhausted
+from .pipeline import collect_incremental, enrich_batch, search_exhausted
 from .schedule import iso
 
 log = logging.getLogger(__name__)
@@ -88,6 +90,7 @@ class Agent:
         self.imap_connect = imap_connect
         self.owner = f"{socket.gethostname()}:{os.getpid()}"
         self._last_idle_log = 0.0
+        self._next_refill_check = 0.0
 
     # -- checks -------------------------------------------------------------------
     def preflight(self) -> list[str]:
@@ -118,11 +121,12 @@ class Agent:
         result["refill"] = self.refill()
         return result
 
-    def maybe_sync_inbox(self, now: datetime) -> Optional[dict[str, int]]:
+    def maybe_sync_inbox(self, now: datetime, max_age_minutes: Optional[float] = None) -> Optional[dict[str, int]]:
         if not (self.mail["imap"].get("host") or self.imap_connect):
             return None
         last = _parse(self.store.get_state("inbox:last_sync"))
-        if last and now - last < timedelta(minutes=float(self.acfg["inbox_sync_minutes"])):
+        max_age = self.acfg["inbox_sync_minutes"] if max_age_minutes is None else max_age_minutes
+        if last and now - last < timedelta(minutes=float(max_age)):
             return None
         self.store.set_state("inbox:last_sync", iso(now))
         own = frozenset(a.lower() for a in (self.mail.get("from_address"), self.acfg.get("report_to")) if a)
@@ -192,17 +196,21 @@ class Agent:
             self.store.set_state("next_send_at", iso(next_at))
         if now < next_at:
             return 0
-        recipients = self.campaign.recipients(limit=1)
-        if not recipients:
+        plan = self.campaign.plan(now, 1)
+        if plan and plan[0][1] == 2 and self.live:
+            # A follow-up must never cross a reply: re-read the mailbox if the last check is > 5 min old.
+            if self.maybe_sync_inbox(now, max_age_minutes=5) is not None:
+                plan = self.campaign.plan(now, 1)
+        if not plan:
             if time.monotonic() - self._last_idle_log > 3600:
                 log.info("No contact ready to e-mail yet (the pipeline is filling up).")
                 self._last_idle_log = time.monotonic()
             return 0
-        company = recipients[0]
+        row, step = plan[0]
         if self.live:
             try:
                 with self.sender_factory(self.mail["smtp"]) as sender:
-                    self.campaign.deliver(sender, company, company["email"])
+                    self.campaign.deliver(sender, row, step)
                 self.store.del_state("smtp_errors")
             except SendBlocked as exc:
                 self.pause(f"the mail provider refused the account: {exc}")
@@ -216,8 +224,8 @@ class Agent:
                 self.store.set_state("next_send_at", iso(now + timedelta(minutes=5)))
                 return 0
         else:
-            self.campaign.preview(company, company["email"])
-            log.info("[rehearsal] would send to %s (%s)", company["email"], company["name"])
+            self.campaign.preview(row, step)
+            log.info("[rehearsal] would send to %s (%s)", row["email"], row["name"])
         self.store.set_state("next_send_at", iso(now + interval * random.uniform(0.7, 1.3)))
         return 1
 
@@ -252,6 +260,9 @@ class Agent:
             f" bounces: {len(self.store.inbox_events_since(day_start, ('bounce',)))}",
         ]
         lines += [f"    - {r['from_addr']} ({r['company_name'] or r['siren']}): {r['subject']}" for r in replies]
+        followups_today = self.store.count_sends_since(day_start, ("sent",), step=2)
+        if followups_today:
+            lines.append(f"  (of which follow-ups: {followups_today})")
         lines += [
             "",
             "Last 7 days",
@@ -264,6 +275,11 @@ class Agent:
             f" with e-mail: {stats['with_email']}, ready to contact: {self.campaign.ready()}",
             f"  registry search exhausted: {'yes - widen the search filters' if self.store.get_state('search_exhausted') else 'no'}",
         ]
+        if len(self.campaign.variants) > 1:
+            lines += ["", "A/B test (first e-mails, last 60 days)"]
+            for v in self.store.variant_stats(self.campaign.name, iso(now - timedelta(days=60))):
+                rate = f"{v['replies'] / v['sent']:.1%}" if v["sent"] else "-"
+                lines.append(f"  {v['variant']}: {v['sent']} sent, {v['replies']} replies ({rate}), {v['optouts']} opt-outs")
         return "\n".join(lines) + "\n"
 
     def notify(self, subject: str, body: str) -> None:
@@ -290,17 +306,22 @@ class Agent:
 
     # -- keeping the pipeline full ------------------------------------------------------
     def refill(self) -> Optional[dict[str, int]]:
-        if self.campaign.ready() >= int(self.acfg["ready_buffer"]):
+        if time.monotonic() < self._next_refill_check:
             return None
-        with_email, n = scrape_batch(self.store, self.cfg, int(self.acfg["scrape_batch"]), self.fetcher)
+        if self.campaign.ready() >= int(self.acfg["ready_buffer"]):
+            self._next_refill_check = time.monotonic() + 300  # stock is full: look again in 5 min
+            return None
+        websites, with_email, n = enrich_batch(self.store, self.cfg, int(self.acfg["enrich_batch"]), self.fetcher)
         if n:
-            return {"scraped": n, "with_email": with_email}
-        found, n = discover_batch(self.store, self.cfg, int(self.acfg["discover_batch"]), self.fetcher)
-        if n:
-            return {"discovered": n, "websites": found}
+            return {"enriched": n, "websites": websites, "with_email": with_email}
         if self.store.get_state("search_exhausted"):
             return None
-        new = collect_incremental(self.store, self.cfg, int(self.acfg["collect_batch"]), self.source)
+        try:
+            new = collect_incremental(self.store, self.cfg, int(self.acfg["collect_batch"]), self.source)
+        except requests.RequestException as exc:
+            log.warning("Registry API unavailable (%s); next attempt in 15 min.", str(exc)[:200])
+            self._next_refill_check = time.monotonic() + 900
+            return {"collected": 0, "error": 1}
         if new == 0 and search_exhausted(self.store, self.cfg, self.source):
             self.store.set_state("search_exhausted", iso(self.clock()))
             self.notify(

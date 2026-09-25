@@ -1,0 +1,14 @@
+Subject: Re: $original_subject
+
+$greeting,
+
+Je me permets de revenir vers vous au sujet de mon message de la semaine dernière.
+
+[RAPPEL DE VOTRE PROPOSITION EN UNE PHRASE]
+
+Si le sujet n'est pas d'actualité pour $company_name, un simple « non merci » me suffit : je ne vous relancerai plus.
+
+Bien cordialement,
+
+[PRÉNOM NOM]
+[FONCTION] - [TÉLÉPHONE]

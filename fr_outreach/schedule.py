@@ -102,6 +102,19 @@ class Schedule:
         local = self.local(now_utc)
         return datetime.combine(local.date(), time(0), tzinfo=self.tz).astimezone(timezone.utc)
 
+    def business_days_cutoff(self, now_utc: datetime, days: int) -> datetime:
+        """UTC instant before which something happened at least `days` sending days ago.
+
+        E.g. on a Friday with days=4, anything sent on Monday or earlier is before the cutoff.
+        """
+        day = self.local(now_utc).date()
+        counted = 0
+        while counted < days:
+            day -= timedelta(days=1)
+            if self.is_sending_day(day):
+                counted += 1
+        return datetime.combine(day + timedelta(days=1), time(0), tzinfo=self.tz).astimezone(timezone.utc)
+
     def send_interval(self, quota: int) -> timedelta:
         """Average spacing that spreads `quota` messages over the window (with some slack)."""
         start, end = self.window(date(2000, 1, 3))

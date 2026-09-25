@@ -154,7 +154,7 @@ class AgentSendingTests(AgentTestCase):
         agent = self.agent(live=False, sender=FakeSender([], RuntimeError("must not send")))
         self.now = at(MONDAY, 7, 5)
         self.assertEqual(agent.tick()["sent"], 1)
-        self.assertEqual(len(list(Path(self.tmp.name).rglob("*.eml"))), 1)
+        self.assertEqual(len(list(Path(self.tmp.name).rglob("*.eml"))), 2)  # first e-mail + follow-up preview
         self.assertEqual(self.store.stats()["dry_run"], 1)
         self.assertEqual(self.store.stats()["sent"], 0)
 
@@ -295,18 +295,29 @@ class RefillTests(AgentTestCase):
     def test_refill_order_and_exhaustion_alert(self):
         self.cfg["agent"]["ready_buffer"] = 10
         agent = self.agent()
-        with mock.patch("fr_outreach.agent.scrape_batch", return_value=(2, 5)) as scrape, \
-                mock.patch("fr_outreach.agent.discover_batch") as discover:
-            self.assertEqual(agent.refill(), {"scraped": 5, "with_email": 2})
-            discover.assert_not_called()
-        with mock.patch("fr_outreach.agent.scrape_batch", return_value=(0, 0)), \
-                mock.patch("fr_outreach.agent.discover_batch", return_value=(0, 0)), \
+        with mock.patch("fr_outreach.agent.enrich_batch", return_value=(3, 2, 5)), \
+                mock.patch("fr_outreach.agent.collect_incremental") as collect:
+            self.assertEqual(agent.refill(), {"enriched": 5, "websites": 3, "with_email": 2})
+            collect.assert_not_called()  # enrich what we have before pulling new companies
+        with mock.patch("fr_outreach.agent.enrich_batch", return_value=(0, 0, 0)), \
                 mock.patch("fr_outreach.agent.collect_incremental", return_value=0), \
                 mock.patch("fr_outreach.agent.search_exhausted", return_value=True):
             self.assertEqual(agent.refill(), {"collected": 0})
         self.assertIsNotNone(self.store.get_state("search_exhausted"))
         self.assertTrue(any("exhausted" in p.read_text() for p in Path(self.tmp.name, "reports").glob("*.txt")))
-        del scrape
+
+
+class RegistryDownTests(AgentTestCase):
+    def test_registry_outage_backs_off_quietly(self):
+        import requests
+
+        self.cfg["agent"]["ready_buffer"] = 10
+        agent = self.agent()
+        with mock.patch("fr_outreach.agent.enrich_batch", return_value=(0, 0, 0)), \
+                mock.patch("fr_outreach.agent.collect_incremental", side_effect=requests.ConnectionError("down")) as collect:
+            self.assertEqual(agent.refill(), {"collected": 0, "error": 1})
+            self.assertIsNone(agent.refill())  # backing off: no new attempt right away
+            self.assertEqual(collect.call_count, 1)
 
 
 class LockTests(unittest.TestCase):

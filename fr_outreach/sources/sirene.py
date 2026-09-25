@@ -15,7 +15,7 @@ import io
 import logging
 import zipfile
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 from ..models import Company
 
@@ -48,91 +48,121 @@ class SireneStockSource:
         self.ul_path = unites_legales_path
         self.etab_path = etablissements_path
 
+    @staticmethod
+    def _company(row: dict[str, str], search: dict[str, Any]) -> Optional[Company]:
+        """Company from a StockUniteLegale row, or None if it does not match the filters."""
+        if row.get("etatAdministratifUniteLegale") != "A":
+            return None
+        if row.get("statutDiffusionUniteLegale") not in (None, "", "O"):
+            return None  # non-diffusible: must not be used
+        if search["_categories"] and row.get("categorieEntreprise") not in search["_categories"]:
+            return None
+        if search["_nafs"] and row.get("activitePrincipaleUniteLegale") not in search["_nafs"]:
+            return None
+        if search["_bands"] and row.get("trancheEffectifsUniteLegale") not in search["_bands"]:
+            return None
+        # Catégorie juridique 1000 = entrepreneur individuel.
+        is_individual = row.get("categorieJuridiqueUniteLegale") == "1000"
+        if search.get("exclude_individual", True) and is_individual:
+            return None
+        name = (
+            row.get("denominationUniteLegale")
+            or row.get("denominationUsuelle1UniteLegale")
+            or " ".join(filter(None, [row.get("prenom1UniteLegale"), row.get("nomUniteLegale")]))
+        )
+        return Company(
+            siren=row["siren"],
+            name=name,
+            legal_name=row.get("denominationUniteLegale") or name,
+            sigle=row.get("sigleUniteLegale") or "",
+            naf=row.get("activitePrincipaleUniteLegale") or "",
+            category=row.get("categorieEntreprise") or "",
+            headcount_band=row.get("trancheEffectifsUniteLegale") or "",
+            creation_date=row.get("dateCreationUniteLegale") or "",
+            is_individual=is_individual,
+            source=SireneStockSource.name,
+        )
+
+    @staticmethod
+    def _head_office(row: dict[str, str], search: dict[str, Any]) -> Optional[tuple[str, str, str, str, str]]:
+        """(address, postal code, city, department, siret) of a head office matching the filters."""
+        if row.get("etablissementSiege") != "true":
+            return None
+        dept = department_of(row.get("codeCommuneEtablissement") or "")
+        postal = row.get("codePostalEtablissement") or ""
+        if search["_departments"] and dept not in search["_departments"]:
+            return None
+        if search["_postal_codes"] and postal not in search["_postal_codes"]:
+            return None
+        street = " ".join(filter(None, [
+            row.get("numeroVoieEtablissement"), row.get("indiceRepetitionEtablissement"),
+            row.get("typeVoieEtablissement"), row.get("libelleVoieEtablissement"),
+        ]))
+        city = row.get("libelleCommuneEtablissement") or ""
+        return " ".join(filter(None, [street, postal, city])), postal, city, dept, row.get("siret") or ""
+
+    @staticmethod
+    def _with_address(company: Company, office: tuple[str, str, str, str, str]) -> Company:
+        company.address, company.postal_code, company.city, company.department, siret = office
+        company.extra["siret_siege"] = siret
+        return company
+
     def search(self, search: dict[str, Any]) -> Iterator[Company]:
-        categories = set(search.get("categories") or [])
-        nafs = set(search.get("naf_codes") or [])
-        bands = set(search.get("headcount_bands") or [])
-        departments = set(search.get("departments") or [])
-        postal_codes = set(search.get("postal_codes") or [])
-        exclude_individual = search.get("exclude_individual", True)
+        search = {
+            **search,
+            "_categories": set(search.get("categories") or []), "_nafs": set(search.get("naf_codes") or []),
+            "_bands": set(search.get("headcount_bands") or []), "_departments": set(search.get("departments") or []),
+            "_postal_codes": set(search.get("postal_codes") or []),
+        }
         max_results = search.get("max_results") or None
         if search.get("regions"):
             log.warning("SIRENE stock files have no region column; use 'departments' instead.")
+        geo = bool(search["_departments"] or search["_postal_codes"])
+        if geo and not self.etab_path:
+            raise ValueError("Filtering by department/postal code needs the StockEtablissement file.")
+
+        def limited(companies: Iterator[Company]) -> Iterator[Company]:
+            for n, company in enumerate(companies, 1):
+                yield company
+                if max_results and n >= max_results:
+                    return
+
+        if geo:
+            # Geographic filter first: only the head offices of the area are kept in memory
+            # (tens of thousands), instead of every matching company in France (millions).
+            offices: dict[str, tuple[str, str, str, str, str]] = {}
+            with _open_csv(self.etab_path) as reader:  # type: ignore[arg-type]
+                for row in reader:
+                    office = self._head_office(row, search)
+                    if office:
+                        offices[row["siren"]] = office
+            log.info("%d head offices in the selected area", len(offices))
+
+            def from_units() -> Iterator[Company]:
+                with _open_csv(self.ul_path) as reader:
+                    for row in reader:
+                        office = offices.get(row.get("siren", ""))
+                        if office and (company := self._company(row, search)):
+                            yield self._with_address(company, office)
+
+            yield from limited(from_units())
+            return
 
         companies: dict[str, Company] = {}
         with _open_csv(self.ul_path) as reader:
             for row in reader:
-                if row.get("etatAdministratifUniteLegale") != "A":
-                    continue
-                if row.get("statutDiffusionUniteLegale") not in (None, "", "O"):
-                    continue  # non-diffusible: must not be used
-                if categories and row.get("categorieEntreprise") not in categories:
-                    continue
-                if nafs and row.get("activitePrincipaleUniteLegale") not in nafs:
-                    continue
-                if bands and row.get("trancheEffectifsUniteLegale") not in bands:
-                    continue
-                # Catégorie juridique 1000 = entrepreneur individuel.
-                is_individual = row.get("categorieJuridiqueUniteLegale") == "1000"
-                if exclude_individual and is_individual:
-                    continue
-                name = (
-                    row.get("denominationUniteLegale")
-                    or row.get("denominationUsuelle1UniteLegale")
-                    or " ".join(filter(None, [row.get("prenom1UniteLegale"), row.get("nomUniteLegale")]))
-                )
-                companies[row["siren"]] = Company(
-                    siren=row["siren"],
-                    name=name,
-                    legal_name=row.get("denominationUniteLegale") or name,
-                    sigle=row.get("sigleUniteLegale") or "",
-                    naf=row.get("activitePrincipaleUniteLegale") or "",
-                    category=row.get("categorieEntreprise") or "",
-                    headcount_band=row.get("trancheEffectifsUniteLegale") or "",
-                    creation_date=row.get("dateCreationUniteLegale") or "",
-                    is_individual=is_individual,
-                    source=self.name,
-                    extra={"nic_siege": row.get("nicSiegeUniteLegale")},
-                )
+                if company := self._company(row, search):
+                    companies[company.siren] = company
         log.info("%d companies match the unit-level filters", len(companies))
-
         if not self.etab_path:
-            if departments or postal_codes:
-                raise ValueError("Filtering by department/postal code needs the StockEtablissement file.")
-            yield from list(companies.values())[:max_results]
+            yield from limited(iter(companies.values()))
             return
 
-        yielded = 0
-        with _open_csv(self.etab_path) as reader:
-            for row in reader:
-                if row.get("etablissementSiege") != "true":
-                    continue
-                company = companies.get(row.get("siren", ""))
-                if company is None:
-                    continue
-                dept = department_of(row.get("codeCommuneEtablissement") or "")
-                postal = row.get("codePostalEtablissement") or ""
-                if departments and dept not in departments:
-                    continue
-                if postal_codes and postal not in postal_codes:
-                    continue
-                street = " ".join(
-                    filter(
-                        None,
-                        [
-                            row.get("numeroVoieEtablissement"),
-                            row.get("indiceRepetitionEtablissement"),
-                            row.get("typeVoieEtablissement"),
-                            row.get("libelleVoieEtablissement"),
-                        ],
-                    )
-                )
-                company.address = " ".join(filter(None, [street, postal, row.get("libelleCommuneEtablissement")]))
-                company.postal_code = postal
-                company.city = row.get("libelleCommuneEtablissement") or ""
-                company.department = dept
-                company.extra["siret_siege"] = row.get("siret")
-                yield company
-                yielded += 1
-                if max_results and yielded >= max_results:
-                    return
+        def from_offices() -> Iterator[Company]:
+            with _open_csv(self.etab_path) as reader:  # type: ignore[arg-type]
+                for row in reader:
+                    company = companies.get(row.get("siren", ""))
+                    if company and (office := self._head_office(row, search)):
+                        yield self._with_address(company, office)
+
+        yield from limited(from_offices())

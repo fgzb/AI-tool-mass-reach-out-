@@ -5,6 +5,7 @@ http:
   # Identify your crawler honestly, with a way to reach you.
   user_agent: "MaSocieteBot/1.0 (+https://www.ma-societe.fr/bot ; contact@ma-societe.fr)"
   timeout: 15
+  connect_timeout: 5           # dead websites fail fast
   per_host_delay: 1.0          # seconds between two requests to the same website
   respect_robots_txt: true
   workers: 8
@@ -52,8 +53,7 @@ agent:
   tick_seconds: 60
   ready_buffer: 150            # contacts kept ready in advance
   collect_batch: 50
-  discover_batch: 20
-  scrape_batch: 20
+  enrich_batch: 20             # companies whose website + e-mails are looked up per tick
   inbox_sync_minutes: 30
   health_window_days: 7
   health_min_sample: 20
@@ -65,6 +65,18 @@ agent:
 mail:
   campaign: "2026-10-premier-contact"
   template: templates/prospection_fr.txt
+  # A/B test: list 2+ templates instead; each company always gets the same one and the
+  # daily report shows the reply rate of each. Keep the best, replace the other.
+  templates: []
+  #  - templates/prospection_fr.txt
+  #  - templates/prospection_fr_b.txt
+  # One follow-up, in the same e-mail thread, to companies that did not reply, opt out or bounce.
+  followup:
+    enabled: true
+    template: templates/relance_fr.txt
+    after_business_days: 4
+    expire_after_days: 14      # skip follow-ups that could not go out in time
+    max_share: 0.5             # at most half of each day's quota; new companies keep flowing
   from_name: "Prénom Nom - Ma Société"
   from_address: "prenom.nom@ma-societe.fr"
   reply_to: ""

@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 
-@dataclass
+@dataclass(slots=True)  # SIRENE imports hold many of these in memory
 class Company:
     siren: str
     name: str
@@ -39,7 +39,7 @@ class Company:
         return row
 
 
-@dataclass
+@dataclass(slots=True)
 class EmailCandidate:
     email: str
     source_url: str

@@ -154,8 +154,12 @@ class SourceTests(unittest.TestCase):
                 w.writerow(["111111111", "11111111100011", "true", "69383", "69003", "LYON", "RUE X"])
                 w.writerow(["555555555", "55555555500011", "true", "75056", "75001", "PARIS", "RUE Y"])
             got = list(SireneStockSource(ul, et).search({"categories": ["PME"], "departments": ["69"]}))
+            everywhere = list(SireneStockSource(ul, et).search({"categories": ["PME"]}))
+            no_address = list(SireneStockSource(ul).search({"categories": ["PME"], "max_results": 1}))
         self.assertEqual([c.siren for c in got], ["111111111"])
-        self.assertEqual((got[0].city, got[0].department), ("LYON", "69"))
+        self.assertEqual((got[0].city, got[0].department, got[0].extra["siret_siege"]), ("LYON", "69", "11111111100011"))
+        self.assertEqual([(c.siren, c.city) for c in everywhere], [("111111111", "LYON"), ("555555555", "PARIS")])
+        self.assertEqual([c.siren for c in no_address], ["111111111"])
 
     def test_csv_import(self):
         with tempfile.TemporaryDirectory() as d:
@@ -202,6 +206,9 @@ def make_cfg(tmpdir: str) -> dict:
     cfg = load_config(None)
     template = Path(tmpdir) / "template.txt"
     template.write_text("Subject: $company_name : une question\n\n$greeting,\nNotre offre.\n", encoding="utf-8")
+    followup = Path(tmpdir) / "followup.txt"
+    followup.write_text("Subject: Re: $original_subject\n\n$greeting,\nPetite relance.\n", encoding="utf-8")
+    cfg["mail"]["followup"]["template"] = str(followup)
     cfg["database"] = ":memory:"
     cfg["mail"].update(
         template=str(template), from_name="Marie Martin", from_address="marie@vendeur.fr",
@@ -269,9 +276,12 @@ class MailerTests(unittest.TestCase):
         self.cfg["mail"]["template"] = str(ROOT / "templates" / "prospection_fr.txt")
         counts = run_campaign(self.store, self.cfg)
         self.assertEqual(counts["dry_run"], 1)
-        files = list(Path(self.tmp.name).rglob("*.eml"))
-        self.assertEqual(len(files), 1)
+        files = sorted(Path(self.tmp.name).rglob("*.eml"))
+        self.assertEqual([f.name for f in files], ["552100554_contact_at_acme.fr.eml", "552100554_contact_at_acme.fr_relance.eml"])
+        follow = email.message_from_bytes(files[1].read_bytes(), policy=policy.default)
         msg = email.message_from_bytes(files[0].read_bytes(), policy=policy.default)
+        self.assertEqual(follow["In-Reply-To"], msg["Message-ID"])  # the follow-up preview is threaded
+        self.assertEqual(follow["Subject"], "Re: " + msg["Subject"])
         body = msg.get_content()
         self.assertEqual(msg["To"], "contact@acme.fr")
         self.assertIn("ACME INDUSTRIE", msg["Subject"])
